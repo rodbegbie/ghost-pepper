@@ -254,10 +254,20 @@ final class TextCleanupManagerTests: XCTestCase {
         XCTAssertEqual(summarization.timeoutSeconds, 90.0)
     }
 
-    func testGGUFCleanupModelsUseSixteenKContextWindow() {
-        XCTAssertEqual(TextCleanupManager.compactModel.maxTokenCount, 16384)
-        XCTAssertEqual(TextCleanupManager.recommendedFastModel.maxTokenCount, 16384)
-        XCTAssertEqual(TextCleanupManager.recommendedFullModel.maxTokenCount, 16384)
+    func testCleanupModelsSupportWikiGenerationsThirtyTwoKContextWindow() {
+        // The catalog ceiling must be >= wikiGenerationContextTokenCount or
+        // loadModel's min(requested, ceiling) clamp would silently cap Wiki
+        // generation back down, regardless of what wikiGenerationContextTokenCount
+        // requests. Summarization (16384) and realtime (4096) are unaffected —
+        // both stay well under this ceiling either way.
+        XCTAssertEqual(TextCleanupManager.compactModel.maxTokenCount, 32768)
+        XCTAssertEqual(TextCleanupManager.recommendedFastModel.maxTokenCount, 32768)
+        XCTAssertEqual(TextCleanupManager.recommendedFullModel.maxTokenCount, 32768)
+        XCTAssertEqual(TextCleanupManager.gemma4WikiModel.maxTokenCount, 32768)
+        XCTAssertGreaterThanOrEqual(
+            TextCleanupManager.compactModel.maxTokenCount,
+            TextCleanupManager.wikiGenerationContextTokenCount
+        )
     }
 
     func testCleanupLogsEstimatedTokenBudgetForPromptAndOutput() async throws {
@@ -405,7 +415,26 @@ final class TextCleanupManagerTests: XCTestCase {
         // headroom for Wiki doesn't also inflate KV-cache/batch-buffer
         // reservation for the agent tool loop or the Settings model probe,
         // which share streamCompletionContextTokenCount instead.
-        XCTAssertEqual(TextCleanupManager.wikiGenerationContextTokenCount, 16384)
+        XCTAssertEqual(TextCleanupManager.wikiGenerationContextTokenCount, 32768)
+    }
+
+    func testStreamCompletionWithWikiGenerationContextIsNotClampedByCatalogCeiling() async throws {
+        // loadModel clamps to min(requested, descriptor.maxTokenCount), so
+        // this only actually reaches 32768 if compactModel's catalog ceiling
+        // was also raised to cover it — regression test for that coupling.
+        let manager = TextCleanupManager(
+            cleanupModelAvailabilityOverrides: [.qwen35_0_8b_q4_k_m: true]
+        )
+
+        let stream = try await manager.streamCompletion(
+            prompt: "hi",
+            modelKind: .qwen35_0_8b_q4_k_m,
+            contextTokenCount: TextCleanupManager.wikiGenerationContextTokenCount
+        )
+
+        XCTAssertEqual(manager.activeLoadedContextTokenCount, 32768)
+
+        for await _ in stream {}
     }
 
     func testStreamCompletionHonorsExplicitContextTokenCountOverride() async throws {
@@ -423,6 +452,39 @@ final class TextCleanupManagerTests: XCTestCase {
         XCTAssertEqual(manager.activeLoadedContextTokenCount, customContext)
 
         for await _ in stream {}
+    }
+
+    func testStreamCompletionTimeoutsAreDedicatedConstants() {
+        // streamCompletion previously had no timeout at all; a stalled
+        // generation with no natural stop token could run until it hit
+        // contextTokenCount, which measured ~300s at Wiki's 32768 ceiling.
+        // Wiki gets its own (longer) timeout for the same reason it gets
+        // its own context constant — its larger context needs more room
+        // before a stalled generation counts as stuck.
+        XCTAssertEqual(TextCleanupManager.streamCompletionTimeoutSeconds, 120)
+        XCTAssertEqual(TextCleanupManager.wikiGenerationTimeoutSeconds, 240)
+    }
+
+    func testStreamCompletionEnforcesTimeoutByEndingTheStreamEarly() async throws {
+        // A vanishingly small timeout should cut generation off almost
+        // immediately rather than running to a natural stop token or the
+        // context ceiling — proves the timeout wiring actually cancels the
+        // generation task instead of just being an unused parameter.
+        let manager = TextCleanupManager(
+            cleanupModelAvailabilityOverrides: [.qwen35_0_8b_q4_k_m: true]
+        )
+
+        let start = Date()
+        let stream = try await manager.streamCompletion(
+            prompt: "hi",
+            modelKind: .qwen35_0_8b_q4_k_m,
+            timeoutSeconds: 0.05
+        )
+
+        for await _ in stream {}
+
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertLessThan(elapsed, 15.0, "Expected the 0.05s timeout to end the stream almost immediately")
     }
 
     func testPlainLoadModelWrapperDefaultsToRealtimeContextNotCatalogCeiling() async {

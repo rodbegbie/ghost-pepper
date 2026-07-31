@@ -187,7 +187,7 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
         url: "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf",
         expectedSHA256: "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
         expectedByteCount: 532_517_120,
-        maxTokenCount: 16_384,
+        maxTokenCount: 32_768,
         recommendation: .veryFast
     )
 
@@ -199,7 +199,7 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
         url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf",
         expectedSHA256: "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
         expectedByteCount: 1_280_835_840,
-        maxTokenCount: 16_384,
+        maxTokenCount: 32_768,
         recommendation: .fast
     )
 
@@ -211,7 +211,7 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
         url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q4_K_M.gguf",
         expectedSHA256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
         expectedByteCount: 2_740_937_888,
-        maxTokenCount: 16_384,
+        maxTokenCount: 32_768,
         recommendation: .full
     )
 
@@ -241,7 +241,7 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
         url: "https://huggingface.co/mlx-community/gemma-4-12B-it-OptiQ-4bit",
         expectedSHA256: "",
         expectedByteCount: 0,
-        maxTokenCount: 16_384,
+        maxTokenCount: 32_768,
         recommendation: nil,
         runtime: .mlxRepository(repoID: "mlx-community/gemma-4-12B-it-OptiQ-4bit")
     )
@@ -390,7 +390,33 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
     /// generation more headroom doesn't also inflate KV-cache/batch-buffer
     /// reservation for the agent tool loop or the Settings model probe,
     /// which don't need it and share that constant instead.
-    static let wikiGenerationContextTokenCount: Int32 = 16384
+    ///
+    /// 32768 rather than 16384: measured against the real downloaded Qwen
+    /// 3.5 4B GGUF, doubling from 16384 costs ~540MB additional peak RSS
+    /// (3296MB -> 3838MB) — modest on the Apple Silicon Macs this app
+    /// targets, and nowhere near the model's actual trained context
+    /// (262144, per its GGUF `qwen35.context_length` metadata), so there's
+    /// no quality-degradation risk from exceeding a trained window.
+    static let wikiGenerationContextTokenCount: Int32 = 32_768
+
+    /// Safety-net timeout for streamCompletion callers that aren't Wiki
+    /// generation (the agent tool loop, the Settings model probe).
+    /// streamCompletion previously had no timeout at all — a stalled or
+    /// rambling generation (no natural stop token) would otherwise run
+    /// until it hit contextTokenCount, which can take minutes. Chosen as
+    /// double CleanupPurpose.summarization's 90s timeout, since these
+    /// callers' context ceiling (16384) is also double realtime's (4096).
+    static let streamCompletionTimeoutSeconds: TimeInterval = 120
+
+    /// Safety-net timeout for Wiki generation specifically — split out for
+    /// the same reason wikiGenerationContextTokenCount is: Wiki's larger
+    /// context (32768) needs more headroom than the agent loop/probe before
+    /// a stalled generation counts as stuck, without silently loosening
+    /// their timeout too. Measured directly: a worst-case stalled
+    /// generation (no stop token, ran until it hit the 32768 context
+    /// ceiling) took ~300s on this hardware, so 240s gives real completions
+    /// room to finish without waiting out a full worst-case run.
+    static let wikiGenerationTimeoutSeconds: TimeInterval = 240
 
     /// Single source of truth for the meeting-summary preference's
     /// last-resort fallback — referenced here and by
@@ -496,15 +522,21 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
     /// passes the prompt straight to the model and yields tokens as they
     /// arrive. Used by `LocalLLMProvider` to drive the agent loop, and by
     /// `LocalStructuredLLM` to drive Wiki generation (passing
-    /// `contextTokenCount: TextCleanupManager.wikiGenerationContextTokenCount`).
+    /// `contextTokenCount: TextCleanupManager.wikiGenerationContextTokenCount,
+    /// timeoutSeconds: TextCleanupManager.wikiGenerationTimeoutSeconds`).
     ///
     /// Acquires the same probe gate as `clean()` so concurrent local cleanup
-    /// and agent runs don't share KV-cache state.
+    /// and agent runs don't share KV-cache state. Unlike `clean()`/`probe()`,
+    /// a timeout here doesn't throw — it cancels the underlying generation
+    /// task and lets the stream finish with whatever tokens arrived, since
+    /// callers are already set up to consume a partial/short stream (the
+    /// same path taken when a caller abandons the stream early).
     func streamCompletion(
         prompt: String,
         modelKind: LocalCleanupModelKind? = nil,
         thinkingMode: ThinkingMode = .suppressed,
-        contextTokenCount: Int32 = streamCompletionContextTokenCount
+        contextTokenCount: Int32 = streamCompletionContextTokenCount,
+        timeoutSeconds: TimeInterval = streamCompletionTimeoutSeconds
     ) async throws -> AsyncStream<String> {
         let requestedModelKind = modelKind ?? selectedCleanupModelKind
         await loadModel(kind: requestedModelKind, contextTokenCount: contextTokenCount)
@@ -541,8 +573,13 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
             await gate.release()
             continuation.finish()
         }
+        let timeoutTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+            task.cancel()
+        }
         continuation.onTermination = { _ in
             task.cancel()
+            timeoutTask.cancel()
         }
         return stream
     }
