@@ -399,6 +399,32 @@ final class TextCleanupManagerTests: XCTestCase {
         for await _ in stream {}
     }
 
+    func testWikiGenerationContextIsADedicatedConstantNotSharedWithStreamCompletion() {
+        // Wiki generation (LocalStructuredLLM) requests its own context
+        // constant rather than streamCompletionContextTokenCount, so raising
+        // headroom for Wiki doesn't also inflate KV-cache/batch-buffer
+        // reservation for the agent tool loop or the Settings model probe,
+        // which share streamCompletionContextTokenCount instead.
+        XCTAssertEqual(TextCleanupManager.wikiGenerationContextTokenCount, 16384)
+    }
+
+    func testStreamCompletionHonorsExplicitContextTokenCountOverride() async throws {
+        let manager = TextCleanupManager(
+            cleanupModelAvailabilityOverrides: [.qwen35_0_8b_q4_k_m: true]
+        )
+        let customContext: Int32 = 12000
+
+        let stream = try await manager.streamCompletion(
+            prompt: "hi",
+            modelKind: .qwen35_0_8b_q4_k_m,
+            contextTokenCount: customContext
+        )
+
+        XCTAssertEqual(manager.activeLoadedContextTokenCount, customContext)
+
+        for await _ in stream {}
+    }
+
     func testPlainLoadModelWrapperDefaultsToRealtimeContextNotCatalogCeiling() async {
         // Preload paths (Settings/Onboarding/ModelsSidebar, the no-arg
         // convenience, startLoad, and prefillPromptContext) all call this

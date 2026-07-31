@@ -50,7 +50,11 @@ final class LocalStructuredLLM {
         } else {
             onStatus?("Loading local model into memory")
         }
-        let stream = try await cleanupManager.streamCompletion(prompt: prompt, modelKind: modelKind)
+        let stream = try await cleanupManager.streamCompletion(
+            prompt: prompt,
+            modelKind: modelKind,
+            contextTokenCount: TextCleanupManager.wikiGenerationContextTokenCount
+        )
         onStatus?("Pre-loading \(phase): reading ~\(inputTokens) input tokens before first output")
         var out = ""
         for await token in stream {

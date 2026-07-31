@@ -377,13 +377,20 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
         return appSupport.appendingPathComponent("GhostPepper/models", isDirectory: true)
     }
 
-    /// Context window for streamCompletion callers (the local agent tool
-    /// loop, Wiki generation, the Settings model probe) — deliberately its
-    /// own constant rather than a model's catalog `maxTokenCount`, so
-    /// raising that ceiling to give the summarization purpose headroom on
-    /// every model doesn't silently inflate KV-cache reservation for these
-    /// unrelated, non-purpose-scoped callers.
+    /// Context window for streamCompletion callers that aren't Wiki
+    /// generation (the local agent tool loop, the Settings model probe) —
+    /// deliberately its own constant rather than a model's catalog
+    /// `maxTokenCount`, so raising that ceiling to give the summarization
+    /// purpose headroom on every model doesn't silently inflate KV-cache
+    /// reservation for these unrelated, non-purpose-scoped callers.
     static let streamCompletionContextTokenCount: Int32 = 16384
+
+    /// Context window for Wiki generation specifically (`LocalStructuredLLM`)
+    /// — split out from `streamCompletionContextTokenCount` so giving Wiki
+    /// generation more headroom doesn't also inflate KV-cache/batch-buffer
+    /// reservation for the agent tool loop or the Settings model probe,
+    /// which don't need it and share that constant instead.
+    static let wikiGenerationContextTokenCount: Int32 = 16384
 
     /// Single source of truth for the meeting-summary preference's
     /// last-resort fallback — referenced here and by
@@ -487,17 +494,20 @@ final class TextCleanupManager: ObservableObject, TextCleaningManaging {
     /// fully-formed prompt string. The caller is responsible for any
     /// chat-template framing (e.g. Qwen3's `<|im_start|>` markers); this method
     /// passes the prompt straight to the model and yields tokens as they
-    /// arrive. Used by `LocalLLMProvider` to drive the agent loop.
+    /// arrive. Used by `LocalLLMProvider` to drive the agent loop, and by
+    /// `LocalStructuredLLM` to drive Wiki generation (passing
+    /// `contextTokenCount: TextCleanupManager.wikiGenerationContextTokenCount`).
     ///
     /// Acquires the same probe gate as `clean()` so concurrent local cleanup
     /// and agent runs don't share KV-cache state.
     func streamCompletion(
         prompt: String,
         modelKind: LocalCleanupModelKind? = nil,
-        thinkingMode: ThinkingMode = .suppressed
+        thinkingMode: ThinkingMode = .suppressed,
+        contextTokenCount: Int32 = streamCompletionContextTokenCount
     ) async throws -> AsyncStream<String> {
         let requestedModelKind = modelKind ?? selectedCleanupModelKind
-        await loadModel(kind: requestedModelKind, contextTokenCount: Self.streamCompletionContextTokenCount)
+        await loadModel(kind: requestedModelKind, contextTokenCount: contextTokenCount)
         let requestedDescriptor = descriptor(for: requestedModelKind)
 
         if case .mlxRepository = requestedDescriptor.runtime {
